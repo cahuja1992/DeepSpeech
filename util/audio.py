@@ -2,7 +2,7 @@ import numpy as np
 import scipy.io.wavfile as wav
 
 from python_speech_features import mfcc
-
+from spec_augment import spec_augment
 
 def audiofile_to_input_vector(audio_filename, numcep, numcontext):
     r"""
@@ -16,9 +16,11 @@ def audiofile_to_input_vector(audio_filename, numcep, numcontext):
 
     # Get mfcc coefficients
     features = mfcc(audio, samplerate=fs, numcep=numcep, winlen=0.032, winstep=0.02, winfunc=np.hamming)
-
-    # Add empty initial and final contexts
+	
+	#ASpechAugment
+	features = spec_augment(mel_spectrogram=features)
+    
+	# Add empty initial and final contexts
     empty_context = np.zeros((numcontext, numcep), dtype=features.dtype)
     features = np.concatenate((empty_context, features, empty_context))
-
     return features
