@@ -15,7 +15,6 @@ from tensorflow.contrib.framework.python.ops import audio_ops as contrib_audio
 from util.config import Config
 from util.text import text_to_char_array
 
-
 def read_csvs(csv_files):
     source_data = None
     for csv in csv_files:
@@ -35,19 +34,23 @@ def samples_to_mfccs(samples, sample_rate, spec_augment=False):
                                                   window_size=Config.audio_window_samples,
                                                   stride=Config.audio_step_samples,
                                                   magnitude_squared=True)
-    if spec_augment:
-		warped_masked_spectrogram = spec_augment(mel_spectrogram=spectrogram)
-	mfccs = contrib_audio.mfcc(spectrogram, sample_rate, dct_coefficient_count=Config.n_input)
-   
-	mfccs = tf.reshape(mfccs, [-1, Config.n_input])
 
+    mfccs = contrib_audio.mfcc(spectrogram, sample_rate, dct_coefficient_count=Config.n_input)
+    #FIXME: w.r.t specAugment the audio_spectrogram needs to be changed to mel_frequence bank in log domain
+    # mfccs = Config.spectrum_augmentator.transform(mfccs) if Config.spectrum_augmentator else mfccs
+    mfccs = tf.reshape(mfccs, [-1, Config.n_input])
+    
     return mfccs, tf.shape(mfccs)[0]
 
 
 def audiofile_to_features(wav_filename):
     samples = tf.io.read_file(wav_filename)
     decoded = contrib_audio.decode_wav(samples, desired_channels=1)
-    features, features_len = samples_to_mfccs(decoded.audio, decoded.sample_rate, spec_augment)
+    audio = decoded.audio
+    if Config.audio_augmentator:
+        audio = Config.audio_augmentator.transform(decoded.audio, decoded.sample_rate)
+
+    features, features_len = samples_to_mfccs(audio, decoded.sample_rate)
 
     return features, features_len
 
