@@ -43,7 +43,7 @@ RUN ln -s -f /usr/bin/python3 /usr/bin/python
 RUN apt-get install -qq -y --allow-downgrades --allow-change-held-packages libnccl2=2.3.7-1+cuda10.0 libnccl-dev=2.3.7-1+cuda10.0
 
 # Install Bazel
-RUN curl -LO "https://github.com/bazelbuild/bazel/releases/download/0.19.2/bazel_0.19.2-linux-x86_64.deb"
+RUN curl -LO "https://github.com/bazelbuild/bazel/releases/download/0.24.1/bazel_0.24.1-linux-x86_64.deb"
 RUN dpkg -i bazel_*.deb
 
 # Install CUDA CLI Tools
@@ -64,18 +64,16 @@ RUN wget https://bootstrap.pypa.io/get-pip.py && \
 # Clone TensoFlow from Mozilla repo
 RUN git clone https://github.com/mozilla/tensorflow/
 WORKDIR /tensorflow
-RUN git checkout r1.13
+RUN git checkout r1.14
 
 
 # GPU Environment Setup
 ENV TF_NEED_CUDA 1
-ENV CUDA_TOOLKIT_PATH /usr/local/cuda
+ENV TF_CUDA_PATHS "/usr/local/cuda,/usr/lib/x86_64-linux-gnu/"
 ENV TF_CUDA_VERSION 10.0
 ENV TF_CUDNN_VERSION 7
-ENV CUDNN_INSTALL_PATH /usr/lib/x86_64-linux-gnu/
 ENV TF_CUDA_COMPUTE_CAPABILITIES 6.0
 ENV TF_NCCL_VERSION 2.3
-# ENV NCCL_INSTALL_PATH /usr/lib/x86_64-linux-gnu/
 
 # Common Environment Setup
 ENV TF_BUILD_CONTAINER_TYPE GPU
@@ -169,7 +167,7 @@ RUN ./configure
 
 
 # Build DeepSpeech
-RUN bazel build --config=monolithic --config=cuda -c opt --copt=-O3 --copt="-D_GLIBCXX_USE_CXX11_ABI=0" --copt=-mtune=generic --copt=-march=x86-64 --copt=-msse --copt=-msse2 --copt=-msse3 --copt=-msse4.1 --copt=-msse4.2 --copt=-mavx --copt=-fvisibility=hidden //native_client:libdeepspeech.so //native_client:generate_trie --verbose_failures --action_env=LD_LIBRARY_PATH=${LD_LIBRARY_PATH}
+RUN bazel build --workspace_status_command="bash native_client/bazel_workspace_status_cmd.sh" --config=monolithic --config=cuda -c opt --copt=-O3 --copt="-D_GLIBCXX_USE_CXX11_ABI=0" --copt=-mtune=generic --copt=-march=x86-64 --copt=-msse --copt=-msse2 --copt=-msse3 --copt=-msse4.1 --copt=-msse4.2 --copt=-mavx --copt=-fvisibility=hidden //native_client:libdeepspeech.so //native_client:generate_trie --verbose_failures --action_env=LD_LIBRARY_PATH=${LD_LIBRARY_PATH}
 
 ###
 ### Using TensorFlow upstream should work
@@ -189,7 +187,7 @@ RUN cp /tensorflow/bazel-bin/native_client/generate_trie /DeepSpeech/native_clie
 
 # Install TensorFlow
 WORKDIR /DeepSpeech/
-RUN pip3 install tensorflow-gpu==1.13.1
+RUN pip3 install tensorflow-gpu==1.14.0
 
 
 # Make DeepSpeech and install Python bindings

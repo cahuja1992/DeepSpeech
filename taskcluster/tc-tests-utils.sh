@@ -55,9 +55,9 @@ model_name="$(basename "${model_source}")"
 model_name_mmap="$(basename -s ".pb" "${model_source}").pbmm"
 model_source_mmap="$(dirname "${model_source}")/${model_name_mmap}"
 
-SUPPORTED_PYTHON_VERSIONS=${SUPPORTED_PYTHON_VERSIONS:-2.7.15:ucs2 2.7.15:ucs4 3.4.9:ucs4 3.5.6:ucs4 3.6.7:ucs4 3.7.1:ucs4}
-SUPPORTED_NODEJS_VERSIONS=${SUPPORTED_NODEJS_VERSIONS:-4.9.1 5.12.0 6.14.4 7.10.1 8.12.0 9.11.2 10.12.0 11.0.0 12.0.0}
-SUPPORTED_ELECTRONJS_VERSIONS=${SUPPORTED_ELECTRONJS_VERSIONS:-1.6.18 1.7.16 1.8.8 2.0.18 3.0.16 3.1.8 4.0.3 4.1.4 5.0.0}
+SUPPORTED_PYTHON_VERSIONS=${SUPPORTED_PYTHON_VERSIONS:-2.7.16:ucs2 2.7.16:ucs4 3.4.10:ucs4 3.5.7:ucs4 3.6.8:ucs4 3.7.3:ucs4}
+SUPPORTED_NODEJS_VERSIONS=${SUPPORTED_NODEJS_VERSIONS:-4.9.1 5.12.0 6.17.1 7.10.1 8.16.0 9.11.2 10.16.0 11.15.0 12.5.0}
+SUPPORTED_ELECTRONJS_VERSIONS=${SUPPORTED_ELECTRONJS_VERSIONS:-1.6.18 1.7.16 1.8.8 2.0.18 3.0.16 3.1.11 4.0.3 4.1.5 4.2.5 5.0.6}
 
 strip() {
   echo "$(echo $1 | sed -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//')"
@@ -252,12 +252,12 @@ assert_correct_multi_ldc93s1()
 
 assert_correct_ldc93s1_prodmodel()
 {
-  assert_correct_inference "$1" "she had a due and greasy wash water year" "$2"
+  assert_correct_inference "$1" "she had reduce suit in greasy water all year" "$2"
 }
 
 assert_correct_ldc93s1_prodmodel_stereo_44k()
 {
-  assert_correct_inference "$1" "she had a due and greasy wash water year" "$2"
+  assert_correct_inference "$1" "she had reduce suit in greasy water all year" "$2"
 }
 
 assert_correct_warning_upsampling()
@@ -309,12 +309,12 @@ check_runtime_electronjs()
 run_tflite_basic_inference_tests()
 {
   set +e
-  phrase_pbmodel_nolm=$(${DS_BINARY_PREFIX}deepspeech --model ${ANDROID_TMP_DIR}/ds/${model_name} --alphabet ${ANDROID_TMP_DIR}/ds/alphabet.txt --audio ${ANDROID_TMP_DIR}/ds/LDC93S1.wav 2>${TASKCLUSTER_TMP_DIR}/stderr)
+  phrase_pbmodel_nolm=$(${DS_BINARY_PREFIX}deepspeech --model ${DATA_TMP_DIR}/${model_name} --alphabet ${DATA_TMP_DIR}/alphabet.txt --audio ${DATA_TMP_DIR}/LDC93S1.wav 2>${TASKCLUSTER_TMP_DIR}/stderr)
   set -e
   assert_correct_ldc93s1 "${phrase_pbmodel_nolm}" "$?"
 
   set +e
-  phrase_pbmodel_nolm=$(${DS_BINARY_PREFIX}deepspeech --model ${ANDROID_TMP_DIR}/ds/${model_name} --alphabet ${ANDROID_TMP_DIR}/ds/alphabet.txt --audio ${ANDROID_TMP_DIR}/ds/LDC93S1.wav --extended 2>${TASKCLUSTER_TMP_DIR}/stderr)
+  phrase_pbmodel_nolm=$(${DS_BINARY_PREFIX}deepspeech --model ${DATA_TMP_DIR}/${model_name} --alphabet ${DATA_TMP_DIR}/alphabet.txt --audio ${DATA_TMP_DIR}/LDC93S1.wav --extended 2>${TASKCLUSTER_TMP_DIR}/stderr)
   set -e
   assert_correct_ldc93s1 "${phrase_pbmodel_nolm}" "$?"
 }
@@ -419,6 +419,26 @@ run_all_inference_tests()
   assert_correct_warning_upsampling "${phrase_pbmodel_withlm_mono_8k}"
 }
 
+run_prod_concurrent_stream_tests()
+{
+  set +e
+  output=$(python ${TASKCLUSTER_TMP_DIR}/test_sources/concurrent_streams.py \
+             --model ${TASKCLUSTER_TMP_DIR}/${model_name_mmap} \
+             --alphabet ${TASKCLUSTER_TMP_DIR}/alphabet.txt \
+             --lm ${TASKCLUSTER_TMP_DIR}/lm.binary \
+             --trie ${TASKCLUSTER_TMP_DIR}/trie \
+             --audio1 ${TASKCLUSTER_TMP_DIR}/LDC93S1.wav \
+             --audio2 ${TASKCLUSTER_TMP_DIR}/new-home-in-the-stars-16k.wav 2>${TASKCLUSTER_TMP_DIR}/stderr)
+  status=$?
+  set -e
+
+  output1=$(echo "${output}" | head -n 1)
+  output2=$(echo "${output}" | tail -n 1)
+
+  assert_correct_ldc93s1_prodmodel "${output1}" "${status}"
+  assert_correct_inference "${output2}" "i must find a new home in the stars" "${status}"
+}
+
 run_prod_inference_tests()
 {
   set +e
@@ -458,6 +478,15 @@ run_multi_inference_tests()
   status=$?
   set -e +o pipefail
   assert_correct_multi_ldc93s1 "${multi_phrase_pbmodel_withlm}" "$status"
+}
+
+run_cpp_only_inference_tests()
+{
+  set +e
+  phrase_pbmodel_withlm_intermediate_decode=$(deepspeech --model ${TASKCLUSTER_TMP_DIR}/${model_name_mmap} --alphabet ${TASKCLUSTER_TMP_DIR}/alphabet.txt --lm ${TASKCLUSTER_TMP_DIR}/lm.binary --trie ${TASKCLUSTER_TMP_DIR}/trie --audio ${TASKCLUSTER_TMP_DIR}/LDC93S1.wav --stream 1280 2>${TASKCLUSTER_TMP_DIR}/stderr | tail -n 1)
+  status=$?
+  set -e
+  assert_correct_ldc93s1_lm "${phrase_pbmodel_withlm_intermediate_decode}" "$status"
 }
 
 android_run_tests()
@@ -540,6 +569,7 @@ download_data()
   cp ${DS_ROOT_TASK}/DeepSpeech/ds/data/alphabet.txt ${TASKCLUSTER_TMP_DIR}/alphabet.txt
   cp ${DS_ROOT_TASK}/DeepSpeech/ds/data/smoke_test/vocab.pruned.lm ${TASKCLUSTER_TMP_DIR}/lm.binary
   cp ${DS_ROOT_TASK}/DeepSpeech/ds/data/smoke_test/vocab.trie ${TASKCLUSTER_TMP_DIR}/trie
+  cp -R ${DS_ROOT_TASK}/DeepSpeech/ds/native_client/test ${TASKCLUSTER_TMP_DIR}/test_sources
 }
 
 download_material()
@@ -577,7 +607,14 @@ install_pyenv()
   if [ ! -e "${PYENV_ROOT}/bin/pyenv" ]; then
     git clone --quiet https://github.com/pyenv/pyenv.git ${PYENV_ROOT}
     pushd ${PYENV_ROOT}
-      git checkout --quiet 835707da2237b8f69560b2de27ae8ddd3e6cb1a4
+      git checkout --quiet eb68ec9488f0df1f668e9272dd5bd8854edf1dff
+    popd
+  fi
+
+  if [ ! -d "${PYENV_ROOT}/plugins/pyenv-alias" ]; then
+    git clone https://github.com/s1341/pyenv-alias.git ${PYENV_ROOT}/plugins/pyenv-alias
+    pushd ${PYENV_ROOT}/plugins/pyenv-alias
+      git checkout --quiet 8896eebb5b47389249b35d21d8a5e74aa33aff08
     popd
   fi
 
@@ -620,11 +657,11 @@ setup_pyenv_virtualenv()
 
   if [ "${OS}" = "${TC_MSYS_VERSION}" ]; then
     echo "installing virtualenv"
-    PATH=${PYENV_ROOT}/versions/python.${version}/tools:${PYENV_ROOT}/versions/python.${version}/tools/Scripts:$PATH pip install virtualenv
+    PATH=${PYENV_ROOT}/versions/${version}/tools:${PYENV_ROOT}/versions/${version}/tools/Scripts:$PATH pip install virtualenv
 
     echo "should setup virtualenv ${name} for ${version}"
-    mkdir ${PYENV_ROOT}/versions/python.${version}/envs
-    PATH=${PYENV_ROOT}/versions/python.${version}/tools:${PYENV_ROOT}/versions/python.${version}/tools/Scripts:$PATH virtualenv ${PYENV_ROOT}/versions/python.${version}/envs/${name}
+    mkdir ${PYENV_ROOT}/versions/${version}/envs
+    PATH=${PYENV_ROOT}/versions/${version}/tools:${PYENV_ROOT}/versions/${version}/tools/Scripts:$PATH virtualenv ${PYENV_ROOT}/versions/${version}/envs/${name}
   else
     pyenv virtualenv ${version} ${name}
   fi
@@ -641,7 +678,7 @@ virtualenv_activate()
   fi;
 
   if [ "${OS}" = "${TC_MSYS_VERSION}" ]; then
-    source ${PYENV_ROOT}/versions/python.${version}/envs/${name}/Scripts/activate
+    source ${PYENV_ROOT}/versions/${version}/envs/${name}/Scripts/activate
   else
     source ${PYENV_ROOT}/versions/${version}/envs/${name}/bin/activate
   fi
@@ -660,16 +697,21 @@ virtualenv_deactivate()
   deactivate
 
   if [ "${OS}" = "${TC_MSYS_VERSION}" ]; then
-    rm -fr ${PYENV_ROOT}/versions/python.${version}/
+    rm -fr ${PYENV_ROOT}/versions/${version}/
   else
     pyenv uninstall --force ${name}
-    pyenv uninstall --force ${version}
   fi
 }
 
 pyenv_install()
 {
   local version=$1
+  local version_alias=$2
+
+  if [ -z "${version_alias}" ]; then
+    echo "WARNING, no version_alias specified, please ensure call site is okay"
+    version_alias=${version}
+  fi;
 
   if [ -z "${PYENV_ROOT}" ]; then
     echo "No PYENV_ROOT set";
@@ -678,13 +720,23 @@ pyenv_install()
 
   if [ "${OS}" = "${TC_MSYS_VERSION}" ]; then
     PATH=$(cygpath ${ChocolateyInstall})/bin:$PATH nuget install python -Version ${version} -OutputDirectory ${PYENV_ROOT}/versions/
-    PATH=${PYENV_ROOT}/versions/python.${version}/tools/:$PATH python -m pip uninstall pip -y
-    PATH=${PYENV_ROOT}/versions/python.${version}/tools/:$PATH python -m ensurepip
-    pushd ${PYENV_ROOT}/versions/python.${version}/tools/Scripts/
+
+    mv ${PYENV_ROOT}/versions/python.${version} ${PYENV_ROOT}/versions/${version_alias}
+
+    PY_TOOLS_DIR="$(cygpath -w ${PYENV_ROOT}/versions/${version_alias}/tools/)"
+    TEMP=$(cygpath -w ${DS_ROOT_TASK}/tmp/) PATH=${PY_TOOLS_DIR}:$PATH python -m pip uninstall pip -y
+    PATH=${PY_TOOLS_DIR}:$PATH python -m ensurepip
+
+    pushd ${PYENV_ROOT}/versions/${version_alias}/tools/Scripts/
       ln -s pip3.exe pip.exe
     popd
   else
-    pyenv install ${version}
+    # If there's already a matching directory, we should re-use it
+    # otherwise, pyenv install will force-rebuild
+    ls -hal "${PYENV_ROOT}/versions/${version_alias}/" || true
+    if [ ! -d "${PYENV_ROOT}/versions/${version_alias}/" ]; then
+      VERSION_ALIAS=${version_alias} pyenv install ${version}
+    fi;
   fi
 }
 
@@ -781,7 +833,7 @@ do_bazel_build()
   fi;
 
   bazel ${BAZEL_OUTPUT_USER_ROOT} build \
-    -s --explain bazel_monolithic.log --verbose_explanations --experimental_strict_action_env --config=monolithic -c opt ${BAZEL_BUILD_FLAGS} ${BAZEL_TARGETS}
+    -s --explain bazel_monolithic.log --verbose_explanations --experimental_strict_action_env --workspace_status_command="bash native_client/bazel_workspace_status_cmd.sh" --config=monolithic -c opt ${BAZEL_BUILD_FLAGS} ${BAZEL_TARGETS}
 
   if is_patched_bazel; then
     find ${DS_ROOT_TASK}/DeepSpeech/tf/bazel-out/ -iname "*.ckd" | tar -cf ${DS_ROOT_TASK}/DeepSpeech/bazel-ckd-ds.tar -T -
@@ -794,14 +846,6 @@ shutdown_bazel()
 {
   cd ${DS_ROOT_TASK}/DeepSpeech/tf
   bazel ${BAZEL_OUTPUT_USER_ROOT} shutdown
-}
-
-do_bazel_shared_build()
-{
-  cd ${DS_ROOT_TASK}/DeepSpeech/tf
-  eval "export ${BAZEL_ENV_FLAGS}"
-  bazel ${BAZEL_OUTPUT_USER_ROOT} build \
-    -s --explain bazel_shared.log --verbose_explanations --experimental_strict_action_env -c opt ${BAZEL_BUILD_FLAGS} ${BAZEL_TARGETS}
 }
 
 do_deepspeech_binary_build()
@@ -1001,7 +1045,7 @@ get_python_pkg_url()
 
 extract_python_versions()
 {
-  # call extract_python_versions ${pyver_full} pyver pyver_pkg py_unicode_type pyconf
+  # call extract_python_versions ${pyver_full} pyver pyver_pkg py_unicode_type pyconf pyalias
   local _pyver_full=$1
 
   if [ -z "${_pyver_full}" ]; then
@@ -1014,6 +1058,8 @@ extract_python_versions()
   # 2.7.x => 27
   local _pyver_pkg=$(echo "${_pyver}" | cut -d'.' -f1,2 | tr -d '.')
 
+  # UCS2 => narrow unicode
+  # UCS4 => wide unicode
   local _py_unicode_type=$(echo "${_pyver_full}" | cut -d':' -f2)
   if [ "${_py_unicode_type}" = "m" ]; then
     local _pyconf="ucs2"
@@ -1021,10 +1067,13 @@ extract_python_versions()
     local _pyconf="ucs4"
   fi;
 
+  local _pyalias="${_pyver}_${_pyconf}"
+
   eval "${2}=${_pyver}"
   eval "${3}=${_pyver_pkg}"
   eval "${4}=${_py_unicode_type}"
   eval "${5}=${_pyconf}"
+  eval "${6}=${_pyalias}"
 }
 
 do_deepspeech_python_build()
@@ -1035,7 +1084,14 @@ do_deepspeech_python_build()
 
   unset PYTHON_BIN_PATH
   unset PYTHONPATH
-  export PYENV_ROOT="${DS_ROOT_TASK}/DeepSpeech/.pyenv"
+
+  if [ -d "${DS_ROOT_TASK}/pyenv.cache/" ]; then
+    export PYENV_ROOT="${DS_ROOT_TASK}/pyenv.cache/DeepSpeech/.pyenv"
+  else
+    export PYENV_ROOT="${DS_ROOT_TASK}/DeepSpeech/.pyenv"
+  fi;
+
+  export PATH_WITHOUT_PYENV=${PATH}
   export PATH="${PYENV_ROOT}/bin:$PATH"
 
   install_pyenv "${PYENV_ROOT}"
@@ -1044,13 +1100,15 @@ do_deepspeech_python_build()
   mkdir -p wheels
 
   SETUP_FLAGS=""
-  if [ "${rename_to_gpu}" ]; then
+  if [ "${rename_to_gpu}" = "--cuda" ]; then
     SETUP_FLAGS="--project_name deepspeech-gpu"
   fi
 
   for pyver_conf in ${SUPPORTED_PYTHON_VERSIONS}; do
     pyver=$(echo "${pyver_conf}" | cut -d':' -f1)
     pyconf=$(echo "${pyver_conf}" | cut -d':' -f2)
+
+    pyalias="${pyver}_${pyconf}"
 
     export NUMPY_BUILD_VERSION="==1.7.0"
     export NUMPY_DEP_VERSION=">=1.7.0"
@@ -1059,10 +1117,12 @@ do_deepspeech_python_build()
 
     maybe_numpy_min_version_winamd64 ${pyver}
 
-    LD_LIBRARY_PATH=${PY37_LDPATH}:$LD_LIBRARY_PATH PYTHON_CONFIGURE_OPTS="--enable-unicode=${pyconf} ${PY37_OPENSSL}" pyenv_install ${pyver}
+    LD_LIBRARY_PATH=${PY37_LDPATH}:$LD_LIBRARY_PATH \
+        PYTHON_CONFIGURE_OPTS="--enable-unicode=${pyconf} ${PY37_OPENSSL}" \
+        pyenv_install ${pyver} ${pyalias}
 
-    setup_pyenv_virtualenv "${pyver}" "deepspeech"
-    virtualenv_activate "${pyver}" "deepspeech"
+    setup_pyenv_virtualenv "${pyalias}" "deepspeech"
+    virtualenv_activate "${pyalias}" "deepspeech"
 
     # Set LD path because python ssl might require it
     LD_LIBRARY_PATH=${PY37_LDPATH}:$LD_LIBRARY_PATH \
@@ -1083,8 +1143,12 @@ do_deepspeech_python_build()
     unset NUMPY_BUILD_VERSION
     unset NUMPY_DEP_VERSION
 
-    virtualenv_deactivate "${pyver}" "deepspeech"
+    virtualenv_deactivate "${pyalias}" "deepspeech"
   done;
+
+  # If not, and if virtualenv_deactivate does not call "pyenv uninstall ${version}"
+  # we get stale python2 in PATH that blocks NodeJS builds
+  export PATH=${PATH_WITHOUT_PYENV}
 }
 
 do_deepspeech_decoder_build()
@@ -1093,7 +1157,13 @@ do_deepspeech_decoder_build()
 
   unset PYTHON_BIN_PATH
   unset PYTHONPATH
-  export PYENV_ROOT="${DS_ROOT_TASK}/DeepSpeech/.pyenv"
+
+  if [ -d "${DS_ROOT_TASK}/pyenv.cache/" ]; then
+    export PYENV_ROOT="${DS_ROOT_TASK}/pyenv.cache/DeepSpeech/.pyenv"
+  else
+    export PYENV_ROOT="${DS_ROOT_TASK}/DeepSpeech/.pyenv"
+  fi;
+
   export PATH="${PYENV_ROOT}/bin:$PATH"
 
   install_pyenv "${PYENV_ROOT}"
@@ -1105,15 +1175,19 @@ do_deepspeech_decoder_build()
     pyver=$(echo "${pyver_conf}" | cut -d':' -f1)
     pyconf=$(echo "${pyver_conf}" | cut -d':' -f2)
 
+    pyalias="${pyver}_${pyconf}"
+
     export NUMPY_BUILD_VERSION="==1.7.0"
     export NUMPY_DEP_VERSION=">=1.7.0"
 
     maybe_ssl102_py37 ${pyver}
 
-    LD_LIBRARY_PATH=${PY37_LDPATH}:$LD_LIBRARY_PATH PYTHON_CONFIGURE_OPTS="--enable-unicode=${pyconf} ${PY37_OPENSSL}" pyenv install ${pyver}
+    LD_LIBRARY_PATH=${PY37_LDPATH}:$LD_LIBRARY_PATH \
+        PYTHON_CONFIGURE_OPTS="--enable-unicode=${pyconf} ${PY37_OPENSSL}" \
+        pyenv_install ${pyver} "${pyalias}"
 
-    pyenv virtualenv ${pyver} deepspeech
-    source ${PYENV_ROOT}/versions/${pyver}/envs/deepspeech/bin/activate
+    setup_pyenv_virtualenv "${pyalias}" "deepspeech"
+    virtualenv_activate "${pyalias}" "deepspeech"
 
     # Set LD path because python ssl might require it
     LD_LIBRARY_PATH=${PY37_LDPATH}:$LD_LIBRARY_PATH \
@@ -1133,17 +1207,20 @@ do_deepspeech_decoder_build()
     unset NUMPY_BUILD_VERSION
     unset NUMPY_DEP_VERSION
 
-    deactivate
-    pyenv uninstall --force deepspeech
-    pyenv uninstall --force ${pyver}
+    virtualenv_deactivate "${pyalias}" "deepspeech"
   done;
+
+  # If not, and if virtualenv_deactivate does not call "pyenv uninstall ${version}"
+  # we get stale python2 in PATH that blocks NodeJS builds
+  export PATH=${PATH_WITHOUT_PYENV}
 }
 
 do_deepspeech_nodejs_build()
 {
   rename_to_gpu=$1
 
-  npm update && npm install node-gyp node-pre-gyp
+  # Force node-gyp 4.x until https://github.com/nodejs/node-gyp/issues/1778 is fixed
+  npm update && npm install node-gyp@4.x node-pre-gyp
 
   # Python 2.7 is required for node-pre-gyp, it is only required to force it on
   # Windows
@@ -1171,12 +1248,12 @@ do_deepspeech_nodejs_build()
       RASPBIAN=${SYSTEM_RASPBIAN} \
       TFDIR=${DS_TFDIR} \
       NODE_ABI_TARGET=--target=$electron \
-      NODE_DIST_URL=--disturl=https://atom.io/download/electron \
+      NODE_DIST_URL=--disturl=https://electronjs.org/headers \
       NODE_RUNTIME=--runtime=electron \
       clean node-wrapper
   done;
 
-  if [ "${rename_to_gpu}" ]; then
+  if [ "${rename_to_gpu}" = "--cuda" ]; then
     make -C native_client/javascript clean npm-pack PROJECT_NAME=deepspeech-gpu
   else
     make -C native_client/javascript clean npm-pack
@@ -1192,7 +1269,8 @@ do_deepspeech_npm_package()
 
   cd ${DS_DSDIR}
 
-  npm update && npm install node-gyp node-pre-gyp
+  # Force node-gyp 4.x until https://github.com/nodejs/node-gyp/issues/1778 is fixed
+  npm update && npm install node-gyp@4.x node-pre-gyp
 
   # Python 2.7 is required for node-pre-gyp, it is only required to force it on
   # Windows
@@ -1211,7 +1289,7 @@ do_deepspeech_npm_package()
     curl -L https://queue.taskcluster.net/v1/task/${dep}/artifacts/public/wrapper.tar.gz | tar -C native_client/javascript -xzvf -
   done;
 
-  if [ "${rename_to_gpu}" ]; then
+  if [ "${rename_to_gpu}" = "--cuda" ]; then
     make -C native_client/javascript clean npm-pack PROJECT_NAME=deepspeech-gpu
   else
     make -C native_client/javascript clean npm-pack
@@ -1286,8 +1364,10 @@ package_native_client()
   ${TAR} -cf - \
     -C ${tensorflow_dir}/bazel-bin/native_client/ generate_trie${PLATFORM_EXE_SUFFIX} \
     -C ${tensorflow_dir}/bazel-bin/native_client/ libdeepspeech.so \
+    -C ${tensorflow_dir}/bazel-bin/native_client/ libdeepspeech.so.if.lib \
     -C ${deepspeech_dir}/ LICENSE \
     -C ${deepspeech_dir}/native_client/ deepspeech${PLATFORM_EXE_SUFFIX} \
+    -C ${deepspeech_dir}/native_client/ deepspeech.h \
     -C ${deepspeech_dir}/native_client/kenlm/ README.mozilla \
     | ${XZ} > "${artifacts_dir}/${artifact_name}"
 }
@@ -1318,9 +1398,30 @@ package_native_client_ndk()
     -C ${deepspeech_dir}/native_client/libs/${arch_abi}/ deepspeech \
     -C ${deepspeech_dir}/native_client/libs/${arch_abi}/ libdeepspeech.so \
     -C ${deepspeech_dir}/native_client/libs/${arch_abi}/ libc++_shared.so \
+    -C ${deepspeech_dir}/native_client/ deepspeech.h \
     -C ${deepspeech_dir}/ LICENSE \
     -C ${deepspeech_dir}/native_client/kenlm/ README.mozilla \
     | pixz -9 > "${artifacts_dir}/${artifact_name}"
+}
+
+package_libdeepspeech_as_zip()
+{
+  tensorflow_dir=${DS_TFDIR}
+  artifacts_dir=${TASKCLUSTER_ARTIFACTS}
+  artifact_name=$1
+
+  if [ ! -d ${tensorflow_dir} -o ! -d ${artifacts_dir} ]; then
+    echo "Missing directory. Please check:"
+    echo "tensorflow_dir=${tensorflow_dir}"
+    echo "artifacts_dir=${artifacts_dir}"
+    exit 1
+  fi;
+
+  if [ -z "${artifact_name}" ]; then
+    echo "Please specify artifact name."
+  fi;
+
+  zip -r9 --junk-paths "${artifacts_dir}/${artifact_name}" ${tensorflow_dir}/bazel-bin/native_client/libdeepspeech.so
 }
 
 android_sdk_accept_licenses()

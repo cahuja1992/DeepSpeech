@@ -8,6 +8,7 @@ from functools import partial
 import numpy as np
 import pandas
 import tensorflow as tf
+import datetime
 
 from tensorflow.contrib.framework.python.ops import audio_ops as contrib_audio
 
@@ -43,8 +44,8 @@ def samples_to_mfccs(samples, sample_rate, spec_augment=False):
     return mfccs, tf.shape(mfccs)[0]
 
 
-def audiofile_to_features(wav_filename, spec_augment=False):
-    samples = tf.read_file(wav_filename)
+def audiofile_to_features(wav_filename):
+    samples = tf.io.read_file(wav_filename)
     decoded = contrib_audio.decode_wav(samples, desired_channels=1)
     features, features_len = samples_to_mfccs(decoded.audio, decoded.sample_rate, spec_augment)
 
@@ -52,9 +53,8 @@ def audiofile_to_features(wav_filename, spec_augment=False):
 
 
 def entry_to_features(wav_filename, transcript):
-    # https://bugs.python.org/issue32117
-    features, features_len = audiofile_to_features(wav_filename, True)
-    return features, features_len, tf.SparseTensor(*transcript)
+    features, features_len = audiofile_to_features(wav_filename)
+    return wav_filename, features, features_len, tf.SparseTensor(*transcript)
 
 
 def to_sparse_tuple(sequence):
@@ -84,12 +84,13 @@ def create_dataset(csvs, batch_size, cache_path=''):
         shape = sparse.dense_shape
         return tf.sparse.reshape(sparse, [shape[0], shape[2]])
 
-    def batch_fn(features, features_len, transcripts):
+    def batch_fn(wav_filenames, features, features_len, transcripts):
         features = tf.data.Dataset.zip((features, features_len))
         features = features.padded_batch(batch_size,
                                          padded_shapes=([None, Config.n_input], []))
         transcripts = transcripts.batch(batch_size).map(sparse_reshape)
-        return tf.data.Dataset.zip((features, transcripts))
+        wav_filenames = wav_filenames.batch(batch_size)
+        return tf.data.Dataset.zip((wav_filenames, features, transcripts))
 
     num_gpus = len(Config.available_devices)
 
@@ -101,3 +102,8 @@ def create_dataset(csvs, batch_size, cache_path=''):
                               .prefetch(num_gpus))
 
     return dataset
+
+def secs_to_hours(secs):
+    hours, remainder = divmod(secs, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return '%d:%02d:%02d' % (hours, minutes, seconds)

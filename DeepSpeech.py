@@ -8,17 +8,18 @@ import sys
 LOG_LEVEL_INDEX = sys.argv.index('--log_level') + 1 if '--log_level' in sys.argv else 0
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = sys.argv[LOG_LEVEL_INDEX] if 0 < LOG_LEVEL_INDEX < len(sys.argv) else '3'
 
-import time
 import numpy as np
 import progressbar
 import shutil
 import tensorflow as tf
+import tensorflow.compat.v1 as tfv1
+import time
 
 from datetime import datetime
 from ds_ctcdecoder import ctc_beam_search_decoder, Scorer
 from evaluate import evaluate
 from six.moves import zip, range
-from tensorflow.python.tools import freeze_graph
+from tensorflow.python.tools import freeze_graph, strip_unused_lib
 from util.config import Config, initialize_globals
 from util.feeding import create_dataset, samples_to_mfccs, audiofile_to_features
 from util.flags import create_flags, FLAGS
@@ -37,7 +38,7 @@ def variable_on_cpu(name, shape, initializer):
     # Use the /cpu:0 device for scoped operations
     with tf.device(Config.cpu_device):
         # Create or get apropos variable
-        var = tf.get_variable(name=name, shape=shape, initializer=initializer)
+        var = tfv1.get_variable(name=name, shape=shape, initializer=initializer)
     return var
 
 
@@ -62,7 +63,7 @@ def create_overlapping_windows(batch_x):
 
 
 def dense(name, x, units, dropout_rate=None, relu=True):
-    with tf.variable_scope(name):
+    with tfv1.variable_scope(name):
         bias = variable_on_cpu('bias', [units], tf.zeros_initializer())
         weights = variable_on_cpu('weights', [x.shape[-1], units], tf.contrib.layers.xavier_initializer())
 
@@ -78,41 +79,74 @@ def dense(name, x, units, dropout_rate=None, relu=True):
 
 
 def rnn_impl_lstmblockfusedcell(x, seq_length, previous_state, reuse):
-    # Forward direction cell:
-    fw_cell = tf.contrib.rnn.LSTMBlockFusedCell(Config.n_cell_dim, reuse=reuse)
+    with tfv1.variable_scope('cudnn_lstm/rnn/multi_rnn_cell/cell_0'):
+        fw_cell = tf.contrib.rnn.LSTMBlockFusedCell(Config.n_cell_dim,
+                                                    reuse=reuse,
+                                                    name='cudnn_compatible_lstm_cell')
 
-    output, output_state = fw_cell(inputs=x,
-                                   dtype=tf.float32,
-                                   sequence_length=seq_length,
-                                   initial_state=previous_state)
+        output, output_state = fw_cell(inputs=x,
+                                       dtype=tf.float32,
+                                       sequence_length=seq_length,
+                                       initial_state=previous_state)
 
     return output, output_state
+
+
+def rnn_impl_cudnn_rnn(x, seq_length, previous_state, _):
+    assert previous_state is None # 'Passing previous state not supported with CuDNN backend'
+
+    # Hack: CudnnLSTM works similarly to Keras layers in that when you instantiate
+    # the object it creates the variables, and then you just call it several times
+    # to enable variable re-use. Because all of our code is structure in an old
+    # school TensorFlow structure where you can just call tf.get_variable again with
+    # reuse=True to reuse variables, we can't easily make use of the object oriented
+    # way CudnnLSTM is implemented, so we save a singleton instance in the function,
+    # emulating a static function variable.
+    if not rnn_impl_cudnn_rnn.cell:
+        # Forward direction cell:
+        fw_cell = tf.contrib.cudnn_rnn.CudnnLSTM(num_layers=1,
+                                                 num_units=Config.n_cell_dim,
+                                                 input_mode='linear_input',
+                                                 direction='unidirectional',
+                                                 dtype=tf.float32)
+        rnn_impl_cudnn_rnn.cell = fw_cell
+
+    output, output_state = rnn_impl_cudnn_rnn.cell(inputs=x,
+                                                   sequence_lengths=seq_length)
+
+    return output, output_state
+
+rnn_impl_cudnn_rnn.cell = None
 
 
 def rnn_impl_static_rnn(x, seq_length, previous_state, reuse):
-    # Forward direction cell:
-    fw_cell = tf.nn.rnn_cell.LSTMCell(Config.n_cell_dim, reuse=reuse)
+    with tfv1.variable_scope('cudnn_lstm/rnn/multi_rnn_cell'):
+        # Forward direction cell:
+        fw_cell = tfv1.nn.rnn_cell.LSTMCell(Config.n_cell_dim,
+                                            reuse=reuse,
+                                            name='cudnn_compatible_lstm_cell')
 
-    # Split rank N tensor into list of rank N-1 tensors
-    x = [x[l] for l in range(x.shape[0])]
+        # Split rank N tensor into list of rank N-1 tensors
+        x = [x[l] for l in range(x.shape[0])]
 
-    # We parametrize the RNN implementation as the training and inference graph
-    # need to do different things here.
-    output, output_state = tf.nn.static_rnn(cell=fw_cell,
-                                            inputs=x,
-                                            initial_state=previous_state,
-                                            dtype=tf.float32,
-                                            sequence_length=seq_length)
-    output = tf.concat(output, 0)
+        output, output_state = tfv1.nn.static_rnn(cell=fw_cell,
+                                                  inputs=x,
+                                                  sequence_length=seq_length,
+                                                  initial_state=previous_state,
+                                                  dtype=tf.float32,
+                                                  scope='cell_0')
+
+        output = tf.concat(output, 0)
 
     return output, output_state
 
 
-def create_model(batch_x, seq_length, dropout, reuse=False, previous_state=None, overlap=True, rnn_impl=rnn_impl_lstmblockfusedcell):
+def create_model(batch_x, batch_size, seq_length, dropout, reuse=False, previous_state=None, overlap=True, rnn_impl=rnn_impl_lstmblockfusedcell):
     layers = {}
 
     # Input shape: [batch_size, n_steps, n_input + 2*n_input*n_context]
-    batch_size = tf.shape(batch_x)[0]
+    if not batch_size:
+        batch_size = tf.shape(batch_x)[0]
 
     # Create overlapping feature windows if needed
     if overlap:
@@ -173,20 +207,25 @@ def create_model(batch_x, seq_length, dropout, reuse=False, previous_state=None,
 # Conveniently, this loss function is implemented in TensorFlow.
 # Thus, we can simply make use of this implementation to define our loss.
 
-def calculate_mean_edit_distance_and_loss(iterator, dropout, reuse):
+def calculate_mean_edit_distance_and_loss(iterator, dropout, batch_size, reuse):
     r'''
     This routine beam search decodes a mini-batch and calculates the loss and mean edit distance.
     Next to total and average loss it returns the mean edit distance,
     the decoded result and the batch's original Y.
     '''
     # Obtain the next batch of data
-    (batch_x, batch_seq_len), batch_y = iterator.get_next()
+    _, (batch_x, batch_seq_len), batch_y = iterator.get_next()
+
+    if FLAGS.use_cudnn_rnn:
+        rnn_impl = rnn_impl_cudnn_rnn
+    else:
+        rnn_impl = rnn_impl_lstmblockfusedcell
 
     # Calculate the logits of the batch
-    logits, _ = create_model(batch_x, batch_seq_len, dropout, reuse=reuse)
+    logits, _ = create_model(batch_x, batch_size, batch_seq_len, dropout, reuse=reuse, rnn_impl=rnn_impl)
 
     # Compute the CTC loss using TensorFlow's `ctc_loss`
-    total_loss = tf.nn.ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
+    total_loss = tfv1.nn.ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
 
     # Calculate the average loss across the batch
     avg_loss = tf.reduce_mean(total_loss)
@@ -205,10 +244,10 @@ def calculate_mean_edit_distance_and_loss(iterator, dropout, reuse):
 # we will use the Adam method for optimization (http://arxiv.org/abs/1412.6980),
 # because, generally, it requires less fine-tuning.
 def create_optimizer():
-    optimizer = tf.train.AdamOptimizer(learning_rate=FLAGS.learning_rate,
-                                       beta1=FLAGS.beta1,
-                                       beta2=FLAGS.beta2,
-                                       epsilon=FLAGS.epsilon)
+    optimizer = tfv1.train.AdamOptimizer(learning_rate=FLAGS.learning_rate,
+                                         beta1=FLAGS.beta1,
+                                         beta2=FLAGS.beta2,
+                                         epsilon=FLAGS.epsilon)
     return optimizer
 
 
@@ -228,7 +267,7 @@ def create_optimizer():
 # on which all operations within the tower execute.
 # For example, all operations of 'tower 0' could execute on the first GPU `tf.device('/gpu:0')`.
 
-def get_tower_results(iterator, optimizer, dropout_rates):
+def get_tower_results(iterator, optimizer, dropout_rates, batch_size):
     r'''
     With this preliminary step out of the way, we can for each GPU introduce a
     tower for which's batch we calculate and return the optimization gradients
@@ -240,7 +279,7 @@ def get_tower_results(iterator, optimizer, dropout_rates):
     # Tower gradients to return
     tower_gradients = []
 
-    with tf.variable_scope(tf.get_variable_scope()):
+    with tfv1.variable_scope(tfv1.get_variable_scope()):
         # Loop over available_devices
         for i in range(len(Config.available_devices)):
             # Execute operations of tower i on device i
@@ -250,10 +289,10 @@ def get_tower_results(iterator, optimizer, dropout_rates):
                 with tf.name_scope('tower_%d' % i):
                     # Calculate the avg_loss and mean_edit_distance and retrieve the decoded
                     # batch along with the original batch's labels (Y) of this tower
-                    avg_loss = calculate_mean_edit_distance_and_loss(iterator, dropout_rates, reuse=i > 0)
+                    avg_loss = calculate_mean_edit_distance_and_loss(iterator, dropout_rates, batch_size, reuse=i > 0)
 
                     # Allow for variables to be re-used by the next tower
-                    tf.get_variable_scope().reuse_variables()
+                    tfv1.get_variable_scope().reuse_variables()
 
                     # Retain tower's avg losses
                     tower_avg_losses.append(avg_loss)
@@ -267,7 +306,7 @@ def get_tower_results(iterator, optimizer, dropout_rates):
 
     avg_loss_across_towers = tf.reduce_mean(tower_avg_losses, 0)
 
-    tf.summary.scalar(name='step_loss', tensor=avg_loss_across_towers, collections=['step_summaries'])
+    tfv1.summary.scalar(name='step_loss', tensor=avg_loss_across_towers, collections=['step_summaries'])
 
     # Return gradients and the average loss
     return tower_gradients, avg_loss_across_towers
@@ -322,18 +361,18 @@ def log_variable(variable, gradient=None):
     '''
     name = variable.name.replace(':', '_')
     mean = tf.reduce_mean(variable)
-    tf.summary.scalar(name='%s/mean'   % name, tensor=mean)
-    tf.summary.scalar(name='%s/sttdev' % name, tensor=tf.sqrt(tf.reduce_mean(tf.square(variable - mean))))
-    tf.summary.scalar(name='%s/max'    % name, tensor=tf.reduce_max(variable))
-    tf.summary.scalar(name='%s/min'    % name, tensor=tf.reduce_min(variable))
-    tf.summary.histogram(name=name, values=variable)
+    tfv1.summary.scalar(name='%s/mean'   % name, tensor=mean)
+    tfv1.summary.scalar(name='%s/sttdev' % name, tensor=tf.sqrt(tf.reduce_mean(tf.square(variable - mean))))
+    tfv1.summary.scalar(name='%s/max'    % name, tensor=tf.reduce_max(variable))
+    tfv1.summary.scalar(name='%s/min'    % name, tensor=tf.reduce_min(variable))
+    tfv1.summary.histogram(name=name, values=variable)
     if gradient is not None:
         if isinstance(gradient, tf.IndexedSlices):
             grad_values = gradient.values
         else:
             grad_values = gradient
         if grad_values is not None:
-            tf.summary.histogram(name='%s/gradients' % name, values=grad_values)
+            tfv1.summary.histogram(name='%s/gradients' % name, values=grad_values)
 
 
 def log_grads_and_vars(grads_and_vars):
@@ -351,7 +390,7 @@ def try_loading(session, saver, checkpoint_filename, caption):
             return False
         checkpoint_path = checkpoint.model_checkpoint_path
         saver.restore(session, checkpoint_path)
-        restored_step = session.run(tf.train.get_global_step())
+        restored_step = session.run(tfv1.train.get_global_step())
         log_info('Restored variables from %s checkpoint at %s, step %d' % (caption, checkpoint_path, restored_step))
         return True
     except tf.errors.InvalidArgumentError as e:
@@ -369,9 +408,9 @@ def train():
                                batch_size=FLAGS.train_batch_size,
                                cache_path=FLAGS.feature_cache)
 
-    iterator = tf.data.Iterator.from_structure(train_set.output_types,
-                                               train_set.output_shapes,
-                                               output_classes=train_set.output_classes)
+    iterator = tfv1.data.Iterator.from_structure(tfv1.data.get_output_types(train_set),
+                                                 tfv1.data.get_output_shapes(train_set),
+                                                 output_classes=tfv1.data.get_output_classes(train_set))
 
     # Make initialization ops for switching between the two sets
     train_init_op = iterator.make_initializer(train_set)
@@ -382,7 +421,7 @@ def train():
         dev_init_ops = [iterator.make_initializer(dev_set) for dev_set in dev_sets]
 
     # Dropout
-    dropout_rates = [tf.placeholder(tf.float32, name='dropout_{}'.format(i)) for i in range(6)]
+    dropout_rates = [tfv1.placeholder(tf.float32, name='dropout_{}'.format(i)) for i in range(6)]
     dropout_feed_dict = {
         dropout_rates[0]: FLAGS.dropout_rate,
         dropout_rates[1]: FLAGS.dropout_rate2,
@@ -397,38 +436,38 @@ def train():
 
     # Building the graph
     optimizer = create_optimizer()
-    gradients, loss = get_tower_results(iterator, optimizer, dropout_rates)
+    gradients, loss = get_tower_results(iterator, optimizer, dropout_rates, FLAGS.train_batch_size)
 
     # Average tower gradients across GPUs
     avg_tower_gradients = average_gradients(gradients)
     log_grads_and_vars(avg_tower_gradients)
 
     # global_step is automagically incremented by the optimizer
-    global_step = tf.train.get_or_create_global_step()
+    global_step = tfv1.train.get_or_create_global_step()
     apply_gradient_op = optimizer.apply_gradients(avg_tower_gradients, global_step=global_step)
 
     # Summaries
-    step_summaries_op = tf.summary.merge_all('step_summaries')
+    step_summaries_op = tfv1.summary.merge_all('step_summaries')
     step_summary_writers = {
-        'train': tf.summary.FileWriter(os.path.join(FLAGS.summary_dir, 'train'), max_queue=120),
-        'dev': tf.summary.FileWriter(os.path.join(FLAGS.summary_dir, 'dev'), max_queue=120)
+        'train': tfv1.summary.FileWriter(os.path.join(FLAGS.summary_dir, 'train'), max_queue=120),
+        'dev': tfv1.summary.FileWriter(os.path.join(FLAGS.summary_dir, 'dev'), max_queue=120)
     }
 
     # Checkpointing
-    checkpoint_saver = tf.train.Saver(max_to_keep=FLAGS.max_to_keep)
+    checkpoint_saver = tfv1.train.Saver(max_to_keep=FLAGS.max_to_keep)
     checkpoint_path = os.path.join(FLAGS.checkpoint_dir, 'train')
     checkpoint_filename = 'checkpoint'
 
-    best_dev_saver = tf.train.Saver(max_to_keep=1)
+    best_dev_saver = tfv1.train.Saver(max_to_keep=1)
     best_dev_path = os.path.join(FLAGS.checkpoint_dir, 'best_dev')
     best_dev_filename = 'best_dev_checkpoint'
 
-    initializer = tf.global_variables_initializer()
+    initializer = tfv1.global_variables_initializer()
 
-    with tf.Session(config=Config.session_config) as session:
+    with tfv1.Session(config=Config.session_config) as session:
         log_debug('Session opened.')
 
-        tf.get_default_graph().finalize()
+        tfv1.get_default_graph().finalize()
 
         # Loading or initializing
         loaded = False
@@ -558,7 +597,7 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
     batch_size = batch_size if batch_size > 0 else None
 
     # Create feature computation graph
-    input_samples = tf.placeholder(tf.float32, [Config.audio_window_samples], 'input_samples')
+    input_samples = tfv1.placeholder(tf.float32, [Config.audio_window_samples], 'input_samples')
     samples = tf.expand_dims(input_samples, -1)
     mfccs, _ = samples_to_mfccs(samples, FLAGS.audio_sample_rate)
     mfccs = tf.identity(mfccs, name='mfccs')
@@ -567,19 +606,15 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
     # This shape is read by the native_client in DS_CreateModel to know the
     # value of n_steps, n_context and n_input. Make sure you update the code
     # there if this shape is changed.
-    input_tensor = tf.placeholder(tf.float32, [batch_size, n_steps if n_steps > 0 else None, 2 * Config.n_context + 1, Config.n_input], name='input_node')
-    seq_length = tf.placeholder(tf.int32, [batch_size], name='input_lengths')
+    input_tensor = tfv1.placeholder(tf.float32, [batch_size, n_steps if n_steps > 0 else None, 2 * Config.n_context + 1, Config.n_input], name='input_node')
+    seq_length = tfv1.placeholder(tf.int32, [batch_size], name='input_lengths')
 
     if batch_size <= 0:
         # no state management since n_step is expected to be dynamic too (see below)
-        previous_state = previous_state_c = previous_state_h = None
+        previous_state = None
     else:
-        if tflite:
-            previous_state_c = tf.placeholder(tf.float32, [batch_size, Config.n_cell_dim], name='previous_state_c')
-            previous_state_h = tf.placeholder(tf.float32, [batch_size, Config.n_cell_dim], name='previous_state_h')
-        else:
-            previous_state_c = variable_on_cpu('previous_state_c', [batch_size, Config.n_cell_dim], initializer=None)
-            previous_state_h = variable_on_cpu('previous_state_h', [batch_size, Config.n_cell_dim], initializer=None)
+        previous_state_c = tfv1.placeholder(tf.float32, [batch_size, Config.n_cell_dim], name='previous_state_c')
+        previous_state_h = tfv1.placeholder(tf.float32, [batch_size, Config.n_cell_dim], name='previous_state_h')
 
         previous_state = tf.contrib.rnn.LSTMStateTuple(previous_state_c, previous_state_h)
 
@@ -592,7 +627,8 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
         rnn_impl = rnn_impl_lstmblockfusedcell
 
     logits, layers = create_model(batch_x=input_tensor,
-                                  seq_length=seq_length if FLAGS.use_seq_length else None,
+                                  batch_size=batch_size,
+                                  seq_length=seq_length if not FLAGS.export_tflite else None,
                                   dropout=no_dropout,
                                   previous_state=previous_state,
                                   overlap=False,
@@ -605,7 +641,7 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
         logits = tf.squeeze(logits, [1])
 
     # Apply softmax for CTC decoder
-    logits = tf.nn.softmax(logits)
+    logits = tf.nn.softmax(logits, name='logits')
 
     if batch_size <= 0:
         if tflite:
@@ -618,51 +654,31 @@ def create_inference_graph(batch_size=1, n_steps=16, tflite=False):
                 'input_lengths': seq_length,
             },
             {
-                'outputs': tf.identity(logits, name='logits'),
+                'outputs': logits,
             },
             layers
         )
 
     new_state_c, new_state_h = layers['rnn_output_state']
-    if tflite:
-        logits = tf.identity(logits, name='logits')
-        new_state_c = tf.identity(new_state_c, name='new_state_c')
-        new_state_h = tf.identity(new_state_h, name='new_state_h')
+    new_state_c = tf.identity(new_state_c, name='new_state_c')
+    new_state_h = tf.identity(new_state_h, name='new_state_h')
 
-        inputs = {
-            'input': input_tensor,
-            'previous_state_c': previous_state_c,
-            'previous_state_h': previous_state_h,
-            'input_samples': input_samples,
-        }
+    inputs = {
+        'input': input_tensor,
+        'previous_state_c': previous_state_c,
+        'previous_state_h': previous_state_h,
+        'input_samples': input_samples,
+    }
 
-        if FLAGS.use_seq_length:
-            inputs.update({'input_lengths': seq_length})
+    if not FLAGS.export_tflite:
+        inputs['input_lengths'] = seq_length
 
-        outputs = {
-            'outputs': logits,
-            'new_state_c': new_state_c,
-            'new_state_h': new_state_h,
-            'mfccs': mfccs,
-        }
-    else:
-        zero_state = tf.zeros([batch_size, Config.n_cell_dim], tf.float32)
-        initialize_c = tf.assign(previous_state_c, zero_state)
-        initialize_h = tf.assign(previous_state_h, zero_state)
-        initialize_state = tf.group(initialize_c, initialize_h, name='initialize_state')
-        with tf.control_dependencies([tf.assign(previous_state_c, new_state_c), tf.assign(previous_state_h, new_state_h)]):
-            logits = tf.identity(logits, name='logits')
-
-        inputs = {
-            'input': input_tensor,
-            'input_lengths': seq_length,
-            'input_samples': input_samples,
-        }
-        outputs = {
-            'outputs': logits,
-            'initialize_state': initialize_state,
-            'mfccs': mfccs,
-        }
+    outputs = {
+        'outputs': logits,
+        'new_state_c': new_state_c,
+        'new_state_h': new_state_h,
+        'mfccs': mfccs,
+    }
 
     return inputs, outputs, layers
 
@@ -682,18 +698,8 @@ def export():
     output_names_ops = [op.name for op in outputs.values() if isinstance(op, Operation)]
     output_names = ",".join(output_names_tensors + output_names_ops)
 
-    if not FLAGS.export_tflite:
-        mapping = {v.op.name: v for v in tf.global_variables() if not v.op.name.startswith('previous_state_')}
-    else:
-        # Create a saver using variables from the above newly created graph
-        def fixup(name):
-            if name.startswith('rnn/lstm_cell/'):
-                return name.replace('rnn/lstm_cell/', 'lstm_fused_cell/')
-            return name
-
-        mapping = {fixup(v.op.name): v for v in tf.global_variables()}
-
-    saver = tf.train.Saver(mapping)
+    # Create a saver using variables from the above newly created graph
+    saver = tfv1.train.Saver()
 
     # Restore variables from training checkpoint
     checkpoint = tf.train.get_checkpoint_state(FLAGS.checkpoint_dir)
@@ -710,9 +716,9 @@ def export():
         if not os.path.isdir(FLAGS.export_dir):
             os.makedirs(FLAGS.export_dir)
 
-        def do_graph_freeze(output_file=None, output_node_names=None, variables_blacklist=None):
-            return freeze_graph.freeze_graph_with_def_protos(
-                input_graph_def=tf.get_default_graph().as_graph_def(),
+        def do_graph_freeze(output_file=None, output_node_names=None, variables_blacklist=''):
+            frozen = freeze_graph.freeze_graph_with_def_protos(
+                input_graph_def=tfv1.get_default_graph().as_graph_def(),
                 input_saver_def=saver.as_saver_def(),
                 input_checkpoint=checkpoint_path,
                 output_node_names=output_node_names,
@@ -723,8 +729,15 @@ def export():
                 variable_names_blacklist=variables_blacklist,
                 initializer_nodes='')
 
+            input_node_names = []
+            return strip_unused_lib.strip_unused(
+                input_graph_def=frozen,
+                input_node_names=input_node_names,
+                output_node_names=output_node_names.split(','),
+                placeholder_type_enum=tf.float32.as_datatype_enum)
+
         if not FLAGS.export_tflite:
-            frozen_graph = do_graph_freeze(output_node_names=output_names, variables_blacklist='previous_state_c,previous_state_h')
+            frozen_graph = do_graph_freeze(output_node_names=output_names)
             frozen_graph.version = int(file_relative_read('GRAPH_VERSION').strip())
 
             # Add a no-op node to the graph with metadata information to be loaded by the native client
@@ -740,7 +753,7 @@ def export():
             with open(output_graph_path, 'wb') as fout:
                 fout.write(frozen_graph.SerializeToString())
         else:
-            frozen_graph = do_graph_freeze(output_node_names=output_names, variables_blacklist='')
+            frozen_graph = do_graph_freeze(output_node_names=output_names)
             output_tflite_path = os.path.join(FLAGS.export_dir, output_filename.replace('.pb', '.tflite'))
 
             converter = tf.lite.TFLiteConverter(frozen_graph, input_tensors=inputs.values(), output_tensors=outputs.values())
@@ -760,12 +773,11 @@ def export():
 
 
 def do_single_file_inference(input_file_path):
-    with tf.Session(config=Config.session_config) as session:
+    with tfv1.Session(config=Config.session_config) as session:
         inputs, outputs, _ = create_inference_graph(batch_size=1, n_steps=-1)
 
         # Create a saver using variables from the above newly created graph
-        mapping = {v.op.name: v for v in tf.global_variables() if not v.op.name.startswith('previous_state_')}
-        saver = tf.train.Saver(mapping)
+        saver = tfv1.train.Saver()
 
         # Restore variables from training checkpoint
         # TODO: This restores the most recent checkpoint, but if we use validation to counteract
@@ -777,9 +789,10 @@ def do_single_file_inference(input_file_path):
 
         checkpoint_path = checkpoint.model_checkpoint_path
         saver.restore(session, checkpoint_path)
-        session.run(outputs['initialize_state'])
 
         features, features_len = audiofile_to_features(input_file_path)
+        previous_state_c = np.zeros([1, Config.n_cell_dim])
+        previous_state_h = np.zeros([1, Config.n_cell_dim])
 
         # Add batch dimension
         features = tf.expand_dims(features, 0)
@@ -792,6 +805,8 @@ def do_single_file_inference(input_file_path):
         logits = outputs['outputs'].eval(feed_dict={
             inputs['input']: features,
             inputs['input_lengths']: features_len,
+            inputs['previous_state_c']: previous_state_c,
+            inputs['previous_state_h']: previous_state_h,
         }, session=session)
 
         logits = np.squeeze(logits)
@@ -808,22 +823,22 @@ def main(_):
     initialize_globals()
 
     if FLAGS.train_files:
-        tf.reset_default_graph()
-        tf.set_random_seed(FLAGS.random_seed)
+        tfv1.reset_default_graph()
+        tfv1.set_random_seed(FLAGS.random_seed)
         train()
 
     if FLAGS.test_files:
-        tf.reset_default_graph()
+        tfv1.reset_default_graph()
         test()
 
     if FLAGS.export_dir:
-        tf.reset_default_graph()
+        tfv1.reset_default_graph()
         export()
 
     if FLAGS.one_shot_infer:
-        tf.reset_default_graph()
+        tfv1.reset_default_graph()
         do_single_file_inference(FLAGS.one_shot_infer)
 
 if __name__ == '__main__':
     create_flags()
-    tf.app.run(main)
+    tfv1.app.run(main)

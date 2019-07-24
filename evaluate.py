@@ -10,6 +10,7 @@ from multiprocessing import cpu_count
 import numpy as np
 import progressbar
 import tensorflow as tf
+import tensorflow.compat.v1 as tfv1
 
 from ds_ctcdecoder import ctc_beam_search_decoder_batch, Scorer
 from six.moves import zip
@@ -19,7 +20,6 @@ from util.evaluate_tools import calculate_report
 from util.feeding import create_dataset
 from util.flags import create_flags, FLAGS
 from util.logging import log_error, log_progress, create_progressbar
-from util.text import levenshtein
 
 
 def sparse_tensor_value_to_texts(value, alphabet):
@@ -47,27 +47,28 @@ def evaluate(test_csvs, create_model, try_loading):
 
     test_csvs = FLAGS.test_files.split(',')
     test_sets = [create_dataset([csv], batch_size=FLAGS.test_batch_size) for csv in test_csvs]
-    iterator = tf.data.Iterator.from_structure(test_sets[0].output_types,
-                                               test_sets[0].output_shapes,
-                                               output_classes=test_sets[0].output_classes)
+    iterator = tfv1.data.Iterator.from_structure(tfv1.data.get_output_types(test_sets[0]),
+                                                 tfv1.data.get_output_shapes(test_sets[0]),
+                                                 output_classes=tfv1.data.get_output_classes(test_sets[0]))
     test_init_ops = [iterator.make_initializer(test_set) for test_set in test_sets]
 
-    (batch_x, batch_x_len), batch_y = iterator.get_next()
+    batch_wav_filename, (batch_x, batch_x_len), batch_y = iterator.get_next()
 
     # One rate per layer
     no_dropout = [None] * 6
     logits, _ = create_model(batch_x=batch_x,
+                             batch_size=FLAGS.test_batch_size,
                              seq_length=batch_x_len,
                              dropout=no_dropout)
 
     # Transpose to batch major and apply softmax for decoder
     transposed = tf.nn.softmax(tf.transpose(logits, [1, 0, 2]))
 
-    loss = tf.nn.ctc_loss(labels=batch_y,
+    loss = tfv1.nn.ctc_loss(labels=batch_y,
                           inputs=logits,
                           sequence_length=batch_x_len)
 
-    tf.train.get_or_create_global_step()
+    tfv1.train.get_or_create_global_step()
 
     # Get number of accessible CPU cores for this process
     try:
@@ -76,9 +77,9 @@ def evaluate(test_csvs, create_model, try_loading):
         num_processes = 1
 
     # Create a saver using variables from the above newly created graph
-    saver = tf.train.Saver()
+    saver = tfv1.train.Saver()
 
-    with tf.Session(config=Config.session_config) as session:
+    with tfv1.Session(config=Config.session_config) as session:
         # Restore variables from training checkpoint
         loaded = try_loading(session, saver, 'best_dev_checkpoint', 'best validation')
         if not loaded:
@@ -88,14 +89,14 @@ def evaluate(test_csvs, create_model, try_loading):
             exit(1)
 
         def run_test(init_op, dataset):
-            logitses = []
+            wav_filenames = []
             losses = []
-            seq_lengths = []
+            predictions = []
             ground_truths = []
 
-            bar = create_progressbar(prefix='Computing acoustic model predictions | ',
+            bar = create_progressbar(prefix='Test epoch | ',
                                      widgets=['Steps: ', progressbar.Counter(), ' | ', progressbar.Timer()]).start()
-            log_progress('Computing acoustic model predictions...')
+            log_progress('Test epoch...')
 
             step_count = 0
 
@@ -105,35 +106,24 @@ def evaluate(test_csvs, create_model, try_loading):
             # First pass, compute losses and transposed logits for decoding
             while True:
                 try:
-                    logits, loss_, lengths, transcripts = session.run([transposed, loss, batch_x_len, batch_y])
+                    batch_wav_filenames, batch_logits, batch_loss, batch_lengths, batch_transcripts = \
+                        session.run([batch_wav_filename, transposed, loss, batch_x_len, batch_y])
                 except tf.errors.OutOfRangeError:
                     break
+
+                decoded = ctc_beam_search_decoder_batch(batch_logits, batch_lengths, Config.alphabet, FLAGS.beam_width,
+                                                        num_processes=num_processes, scorer=scorer)
+                predictions.extend(d[0][1] for d in decoded)
+                ground_truths.extend(sparse_tensor_value_to_texts(batch_transcripts, Config.alphabet))
+                wav_filenames.extend(wav_filename.decode('UTF-8') for wav_filename in batch_wav_filenames)
+                losses.extend(batch_loss)
 
                 step_count += 1
                 bar.update(step_count)
 
-                logitses.append(logits)
-                losses.extend(loss_)
-                seq_lengths.append(lengths)
-                ground_truths.extend(sparse_tensor_value_to_texts(transcripts, Config.alphabet))
-
             bar.finish()
 
-            predictions = []
-
-            bar = create_progressbar(max_value=step_count,
-                                     prefix='Decoding predictions | ').start()
-            log_progress('Decoding predictions...')
-
-            # Second pass, decode logits and compute WER and edit distance metrics
-            for logits, seq_length in bar(zip(logitses, seq_lengths)):
-                decoded = ctc_beam_search_decoder_batch(logits, seq_length, Config.alphabet, FLAGS.beam_width,
-                                                        num_processes=num_processes, scorer=scorer)
-                predictions.extend(d[0][1] for d in decoded)
-
-            distances = [levenshtein(a, b) for a, b in zip(ground_truths, predictions)]
-
-            wer, cer, samples = calculate_report(ground_truths, predictions, distances, losses)
+            wer, cer, samples = calculate_report(wav_filenames, ground_truths, predictions, losses)
             mean_loss = np.mean(losses)
 
             # Take only the first report_count items
@@ -144,7 +134,8 @@ def evaluate(test_csvs, create_model, try_loading):
             print('-' * 80)
             for sample in report_samples:
                 print('WER: %f, CER: %f, loss: %f' %
-                      (sample.wer, sample.distance, sample.loss))
+                      (sample.wer, sample.cer, sample.loss))
+                print(' - wav: file://%s' % sample.wav_filename)
                 print(' - src: "%s"' % sample.src)
                 print(' - res: "%s"' % sample.res)
                 print('-' * 80)
@@ -177,4 +168,4 @@ def main(_):
 if __name__ == '__main__':
     create_flags()
     tf.app.flags.DEFINE_string('test_output_file', '', 'path to a file to save all src/decoded/distance/loss tuples')
-    tf.app.run(main)
+    tfv1.app.run(main)
